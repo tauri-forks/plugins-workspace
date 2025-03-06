@@ -1,14 +1,4 @@
-// Copyright 2019-2023 Tauri Programme within The Commons Conservancy
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-License-Identifier: MIT
-
-//! Open a WebSocket connection using a Rust client in JS.
-
-#![doc(
-    html_logo_url = "https://github.com/tauri-apps/tauri/raw/dev/app-icon.png",
-    html_favicon_url = "https://github.com/tauri-apps/tauri/raw/dev/app-icon.png"
-)]
-
+use serde_json::json;
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use http::header::{HeaderName, HeaderValue};
 use serde::{ser::Serializer, Deserialize, Serialize};
@@ -34,7 +24,7 @@ use tokio_tungstenite::{
 use std::collections::HashMap;
 use std::str::FromStr;
 
-type Id = u32;
+type Id = String;
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WebSocketWriter = SplitSink<WebSocket, Message>;
 type Result<T> = std::result::Result<T, Error>;
@@ -53,8 +43,8 @@ enum Error {
 
 impl Serialize for Error {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
+        where
+          S: Serializer,
     {
         serializer.serialize_str(self.to_string().as_str())
     }
@@ -84,12 +74,13 @@ pub(crate) struct ConnectionConfig {
     #[serde(default)]
     pub accept_unmasked_frames: bool,
     pub headers: Option<Vec<(String, String)>>,
+    pub agent_id: Option<String>,
 }
 
 impl From<ConnectionConfig> for WebSocketConfig {
     fn from(config: ConnectionConfig) -> Self {
         let mut builder =
-            WebSocketConfig::default().accept_unmasked_frames(config.accept_unmasked_frames);
+          WebSocketConfig::default().accept_unmasked_frames(config.accept_unmasked_frames);
 
         if let Some(read_buffer_size) = config.read_buffer_size {
             builder = builder.read_buffer_size(read_buffer_size)
@@ -138,6 +129,7 @@ enum WebSocketMessage {
     Pong(Vec<u8>),
     Close(Option<CloseFrame>),
 }
+use std::sync::Arc;
 
 #[tauri::command]
 async fn connect<R: Runtime>(
@@ -146,7 +138,16 @@ async fn connect<R: Runtime>(
     on_message: Channel<serde_json::Value>,
     config: Option<ConnectionConfig>,
 ) -> Result<Id> {
-    let id = rand::random();
+    // 获取登录客服的 agent_id
+    let agent_id = match config.as_ref().and_then(|c| c.agent_id.clone()) {
+        Some(id) => id,
+        None => return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "agent_id 必须存在"
+        ))),
+    };
+    let id: Id = agent_id.clone();
+
     let mut request = url.into_client_request()?;
 
     if let Some(headers) = config.as_ref().and_then(|c| c.headers.as_ref()) {
@@ -158,29 +159,41 @@ async fn connect<R: Runtime>(
     }
 
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
-    let tls_connector = match window.try_state::<TlsConnector>() {
+      let tls_connector = match window.try_state::<TlsConnector>() {
         Some(tls_connector) => tls_connector.0.lock().await.clone(),
         None => None,
     };
 
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
-    let (ws_stream, _) =
-        connect_async_tls_with_config(request, config.map(Into::into), false, tls_connector)
-            .await?;
+      let (ws_stream, _) =
+      connect_async_tls_with_config(request, config.map(Into::into), false, tls_connector)
+        .await?;
     #[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
-    let (ws_stream, _) = connect_async_with_config(request, config.map(Into::into), false).await?;
+      let (ws_stream, _) = connect_async_with_config(request, config.map(Into::into), false).await?;
 
     tauri::async_runtime::spawn(async move {
         let (write, read) = ws_stream.split();
         let manager = window.state::<ConnectionManager>();
-        manager.0.lock().await.insert(id, write);
+        if let Some(mut existing_write) = manager.0.lock().await.remove(&id) {
+            existing_write
+              .send(Message::Close(Some(ProtocolCloseFrame {
+                  code: 1000.into(),
+                  reason: "Reconnecting".into(),
+              }))).await;
+        }
+        manager.0.lock().await.insert(id.clone(), write);
+
+        let window_arc = Arc::new(Mutex::new(window));
+
         read.for_each(move |message| {
-            let window_ = window.clone();
+            let window_ = Arc::clone(&window_arc);
             let on_message_ = on_message.clone();
+            let id_clone = id.clone();
             async move {
                 if let Ok(Message::Close(_)) = message {
-                    let manager = window_.state::<ConnectionManager>();
-                    manager.0.lock().await.remove(&id);
+                    let manager_lock = window_.lock().await;
+                    let manager = manager_lock.state::<ConnectionManager>();
+                    manager.0.lock().await.remove(&id_clone);
                 }
 
                 let response = match message {
@@ -201,19 +214,18 @@ async fn connect<R: Runtime>(
                             code: v.code.into(),
                             reason: v.reason.to_string(),
                         })))
-                        .unwrap()
+                          .unwrap()
                     }
-                    Ok(Message::Frame(_)) => serde_json::Value::Null, // This value can't be recieved.
+                    Ok(Message::Frame(_)) => serde_json::Value::Null,
                     Err(e) => serde_json::to_value(Error::from(e)).unwrap(),
                 };
-
                 let _ = on_message_.send(response);
             }
         })
-        .await;
+          .await;
     });
 
-    Ok(id)
+    Ok(agent_id)
 }
 
 #[tauri::command]
@@ -224,17 +236,17 @@ async fn send(
 ) -> Result<()> {
     if let Some(write) = manager.0.lock().await.get_mut(&id) {
         write
-            .send(match message {
-                WebSocketMessage::Text(t) => Message::Text(t.into()),
-                WebSocketMessage::Binary(t) => Message::Binary(t.into()),
-                WebSocketMessage::Ping(t) => Message::Ping(t.into()),
-                WebSocketMessage::Pong(t) => Message::Pong(t.into()),
-                WebSocketMessage::Close(t) => Message::Close(t.map(|v| ProtocolCloseFrame {
-                    code: v.code.into(),
-                    reason: v.reason.into(),
-                })),
-            })
-            .await?;
+          .send(match message {
+              WebSocketMessage::Text(t) => Message::Text(t.into()),
+              WebSocketMessage::Binary(t) => Message::Binary(t.into()),
+              WebSocketMessage::Ping(t) => Message::Ping(t.into()),
+              WebSocketMessage::Pong(t) => Message::Pong(t.into()),
+              WebSocketMessage::Close(t) => Message::Close(t.map(|v| ProtocolCloseFrame {
+                  code: v.code.into(),
+                  reason: v.reason.into(),
+              })),
+          })
+          .await?;
         Ok(())
     } else {
         Err(Error::ConnectionNotFound(id))
@@ -264,13 +276,13 @@ impl Builder {
 
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         PluginBuilder::new("websocket")
-            .invoke_handler(tauri::generate_handler![connect, send])
-            .setup(|app, _api| {
-                app.manage(ConnectionManager::default());
-                #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
-                app.manage(TlsConnector(Mutex::new(self.tls_connector)));
-                Ok(())
-            })
-            .build()
+          .invoke_handler(tauri::generate_handler![connect, send])
+          .setup(|app, _api| {
+              app.manage(ConnectionManager::default());
+              #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
+              app.manage(TlsConnector(Mutex::new(self.tls_connector)));
+              Ok(())
+          })
+          .build()
     }
 }
